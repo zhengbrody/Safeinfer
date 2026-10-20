@@ -39,7 +39,7 @@ def load_model(
         raise FileNotFoundError(f"no .safetensors files in {model_dir}")
     for file in files:
         with safe_open(file, framework="pt", device=str(device)) as f:
-            for key in f.keys():
+            for key in f.keys():  # noqa: SIM118 -- safe_open handles are not iterable
                 state[key] = f.get_tensor(key).to(dtype)
 
     if cfg.tie_word_embeddings:

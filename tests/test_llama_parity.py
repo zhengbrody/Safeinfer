@@ -14,15 +14,15 @@ from safeinfer.attention.backend import AttentionMetadata
 from safeinfer.attention.dense import DenseAttention
 from safeinfer.model.loader import load_model
 
-TINY = dict(
-    vocab_size=256,
-    hidden_size=64,
-    intermediate_size=128,
-    num_hidden_layers=3,
-    num_attention_heads=4,
-    num_key_value_heads=2,  # GQA
-    max_position_embeddings=512,
-)
+TINY = {
+    "vocab_size": 256,
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 3,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,  # GQA
+    "max_position_embeddings": 512,
+}
 LLAMA3_ROPE = {
     "rope_type": "llama3",
     "rope_theta": 500000.0,
