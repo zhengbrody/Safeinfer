@@ -69,6 +69,7 @@ sequences; compare logits with a tolerance there.
 ```bash
 pip install -e ".[dev]"
 pytest -q                     # CPU, ~5s
+SAFEINFER_TEST_MODEL=meta-llama/Llama-3.2-1B-Instruct pytest tests/test_real_checkpoint.py  # ~10 GB RAM
 ruff check . && ruff format --check .
 python -m safeinfer.bench.run_bench --backend hf --model <hf-id-or-dir> \
     [--dataset sharegpt.json] --num-requests 200 --rate 4 --out results/hf_r4.json
@@ -79,6 +80,7 @@ python -m safeinfer.bench.run_bench --backend hf --model <hf-id-or-dir> \
 - [x] **Week 1: model, baseline, measurement**
   - [x] Llama/Qwen2 forward (RMSNorm, RoPE incl. llama3 scaling, GQA, SwiGLU, qkv bias)
   - [x] safetensors loader; logits, hidden states, and 20-step greedy decode match HF
+  - [x] real Llama-3.2-1B-Instruct (fp32, CPU): logits bit-identical to HF (max diff 0), 24-step greedy identical
   - [x] workload generator, metrics, HF static-batching baseline, bench CLI, CI
   - [ ] run the baseline on a GPU with the target model (needs GPU access)
 - [ ] **Week 2: paged KV cache.** `memory/block_manager.py` (+ hypothesis property
@@ -94,3 +96,5 @@ python -m safeinfer.bench.run_bench --backend hf --model <hf-id-or-dir> \
 ## Changelog
 
 - 2026-10-20: Project scaffold. Week-1 model, loader, parity tests, and bench tooling done.
+- 2026-10-20: Real-checkpoint parity test (opt-in via SAFEINFER_TEST_MODEL); Llama-3.2-1B bit-identical to HF.
+  Ruff pinned with explicit rule set so local and CI lint agree.
