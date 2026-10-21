@@ -82,3 +82,41 @@ def test_paged_batched_generation_matches(setup):
         with torch.no_grad():
             ref = hf.generate(torch.tensor([p]), max_new_tokens=steps, min_new_tokens=steps, do_sample=False)
         assert got == ref[0, len(p) :].tolist()
+
+
+def test_continuous_batching_with_preemption_matches(setup):
+    """Staggered arrivals, chunked prefill, and a pool too small for all three: outputs unchanged.
+
+    The first request keeps EOS enabled, so it also checks that we stop exactly where HF does.
+    """
+    from safeinfer.engine.engine import LLMEngine
+    from safeinfer.sampling_params import SamplingParams
+    from safeinfer.scheduler.scheduler import SchedulerConfig
+
+    hf, ours, prompt = setup
+    prompts = [prompt, prompt[:20], prompt[:30]]
+    params = [
+        SamplingParams(max_tokens=48),
+        SamplingParams(max_tokens=24, ignore_eos=True),
+        SamplingParams(max_tokens=32, ignore_eos=True),
+    ]
+    config = SchedulerConfig(max_num_batched_tokens=32, max_model_len=128, enable_chunked_prefill=True)
+    engine = LLMEngine(ModelRunner(ours, num_blocks=10, block_size=16), config)
+
+    outputs: dict[int, list[int]] = {}
+    for p, sp in zip(prompts, params, strict=True):
+        outputs[engine.add_request(p, sp)] = []
+        for _ in range(3):  # the next request arrives while this one is mid-flight
+            for o in engine.step():
+                outputs[o.seq_id].append(o.token_id)
+    while engine.has_unfinished_requests():
+        for o in engine.step():
+            outputs[o.seq_id].append(o.token_id)
+
+    assert engine.num_preemptions > 0
+    for p, sp, got in zip(prompts, params, outputs.values(), strict=True):
+        n = sp.max_tokens
+        kwargs = {} if not sp.ignore_eos else {"min_new_tokens": n}
+        with torch.no_grad():
+            ref = hf.generate(torch.tensor([p]), max_new_tokens=n, do_sample=False, **kwargs)
+        assert got == ref[0, len(p) :].tolist()

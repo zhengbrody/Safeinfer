@@ -104,3 +104,25 @@ def test_kv_utilization_hand_computed():
     # Paged reserves 4 slots at length 4, then 8 at length 5.
     assert paged["utilization"] == pytest.approx((4 + 5) / (4 + 8))
     assert paged["concurrency"] == 100 // 8
+
+
+def test_continuous_replay_lets_requests_join_mid_batch(models):
+    from safeinfer.bench.continuous_replay import replay_continuous
+    from safeinfer.engine.engine import LLMEngine
+    from safeinfer.scheduler.scheduler import SchedulerConfig
+
+    _, ours = models
+    # One long request, then short ones: under static batching the short ones would wait for it.
+    requests = build_workload([(6, 20)] + [(4, 2)] * 3, math.inf, 256)
+    engine = LLMEngine(
+        ModelRunner(ours, num_blocks=32, block_size=4), SchedulerConfig(max_num_seqs=2, max_model_len=32)
+    )
+
+    timings = {t.request_id: t for t in replay_continuous(requests, engine)}
+
+    assert sorted(timings) == [0, 1, 2, 3]
+    for t in timings.values():
+        assert t.arrival_time <= t.first_token_time <= t.finish_time
+    # Requests 2 and 3 take request 1's slot as it frees up, while request 0 is still decoding.
+    assert max(t.finish_time for i, t in timings.items() if i > 0) < timings[0].finish_time
+    assert engine.runner.block_manager.num_free_blocks == 32
