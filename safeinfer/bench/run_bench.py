@@ -3,8 +3,9 @@
     python -m safeinfer.bench.run_bench --backend hf --model meta-llama/Llama-3.2-1B-Instruct \
         --dataset ShareGPT_V3_unfiltered_cleaned_split.json --num-requests 200 --rate 4
 
-Sweep --rate to trace the throughput / latency curve. Backends for our own
-engine and vLLM plug in here as they are built.
+Backends: `hf` (HF generate, static batching) and `engine-static` (our paged
+engine, static batching). Sweep --rate to trace the throughput / latency
+curve. Continuous batching and vLLM plug in here as they are built.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import numpy as np
 import torch
 
 from safeinfer.bench.metrics import RequestTiming, summarize
+from safeinfer.bench.static_replay import replay_static_batching
 from safeinfer.bench.workload import Request, build_workload, fixed_lengths, sharegpt_lengths
 
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
@@ -27,22 +29,50 @@ DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch
 def _run_hf(args, device: torch.device) -> tuple[list[RequestTiming], dict]:
     from transformers import AutoModelForCausalLM
 
-    from safeinfer.bench.hf_baseline import run_static_batching
+    from safeinfer.bench.hf_baseline import hf_batch_runner
 
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=DTYPES[args.dtype], attn_implementation="sdpa")
     model = model.to(device).eval()
     requests = _make_requests(args, model.config.vocab_size)
+    run_batch = hf_batch_runner(model)
 
-    # Warm up kernels and the allocator outside the timed run.
-    warmup = [Request(-1, 0.0, requests[0].prompt_token_ids, 4)]
-    run_static_batching(model, warmup, max_batch_size=1)
-    _reset_peak_memory(device)
-
-    timings = run_static_batching(model, requests, max_batch_size=args.max_batch_size)
+    _warm_up(run_batch, requests[0], device)
+    timings = replay_static_batching(requests, run_batch, args.max_batch_size)
     return timings, {"max_batch_size": args.max_batch_size}
 
 
-BACKENDS = {"hf": _run_hf}
+def _run_engine_static(args, device: torch.device) -> tuple[list[RequestTiming], dict]:
+    from safeinfer.bench.engine_static import engine_batch_runner, engine_can_admit
+    from safeinfer.engine.model_runner import ModelRunner
+    from safeinfer.memory.kv_cache import gpu_kv_budget, num_blocks_for_budget
+    from safeinfer.model.loader import load_model
+
+    dtype = DTYPES[args.dtype]
+    model = load_model(args.model, dtype=dtype, device=device)
+    num_blocks = args.num_blocks
+    if num_blocks is None:
+        if device.type != "cuda":
+            raise SystemExit("--num-blocks is required off-GPU")
+        budget = gpu_kv_budget(device, args.gpu_memory_utilization, activation_reserve_bytes=2**30)
+        num_blocks = num_blocks_for_budget(model.config, args.block_size, dtype, budget)
+    runner = ModelRunner(model, num_blocks=num_blocks, block_size=args.block_size)
+    requests = _make_requests(args, model.config.vocab_size)
+    run_batch = engine_batch_runner(runner)
+
+    _warm_up(run_batch, requests[0], device)
+    timings = replay_static_batching(requests, run_batch, args.max_batch_size, engine_can_admit(runner))
+    return timings, {"max_batch_size": args.max_batch_size, "num_blocks": num_blocks, "block_size": args.block_size}
+
+
+BACKENDS = {"hf": _run_hf, "engine-static": _run_engine_static}
+
+
+def _warm_up(run_batch, request: Request, device: torch.device) -> None:
+    """Compile kernels and grow the allocator outside the timed run."""
+    run_batch([Request(-1, 0.0, request.prompt_token_ids, 4)], time.perf_counter())
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
 
 
 def _make_requests(args, vocab_size: int) -> list[Request]:
@@ -55,12 +85,6 @@ def _make_requests(args, vocab_size: int) -> list[Request]:
     else:
         lengths = fixed_lengths(args.num_requests, args.prompt_len, args.output_len)
     return build_workload(lengths, args.rate, vocab_size, seed=args.seed)
-
-
-def _reset_peak_memory(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
 
 
 def _environment(device: torch.device) -> dict:
@@ -89,6 +113,9 @@ def main() -> None:
     p.add_argument("--num-requests", type=int, default=200)
     p.add_argument("--rate", type=float, default=float("inf"), help="requests/s (Poisson); inf = all at t=0")
     p.add_argument("--max-batch-size", type=int, default=32)
+    p.add_argument("--block-size", type=int, default=16, help="engine: tokens per KV block")
+    p.add_argument("--num-blocks", type=int, help="engine: KV blocks; default sizes from free GPU memory")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="engine: fraction of GPU memory to use")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=Path, help="write the result JSON here")
     args = p.parse_args()

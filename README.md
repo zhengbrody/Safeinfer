@@ -5,9 +5,11 @@ cache and continuous batching, and runs linear safety probes on activations
 from the same forward pass, so risky generations can be flagged or stopped
 mid-decode at almost no extra cost.
 
-**Status:** week 1 of 5. The hand-written Llama/Qwen2 forward matches
-HuggingFace, and the HF static-batching baseline and benchmark harness are
-done. See [CLAUDE.md](CLAUDE.md) for architecture and roadmap.
+**Status:** week 2 of 5. The hand-written Llama/Qwen2 forward and the paged
+KV cache reproduce HuggingFace token for token (real Llama-3.2-1B included).
+On 1000 ShareGPT conversations, paging cuts KV waste from 80.6% to 1.8% and
+fits 4.4x more concurrent requests in the same memory. See
+[CLAUDE.md](CLAUDE.md) for architecture, results, and roadmap.
 
 ```bash
 pip install -e ".[dev]"

@@ -7,9 +7,12 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, LlamaConfig
 
-from safeinfer.bench.hf_baseline import run_static_batching
+from safeinfer.bench.engine_static import engine_batch_runner, engine_can_admit
+from safeinfer.bench.hf_baseline import hf_batch_runner
 from safeinfer.bench.metrics import RequestTiming, summarize
+from safeinfer.bench.static_replay import replay_static_batching
 from safeinfer.bench.workload import build_workload, fixed_lengths, poisson_arrival_times
+from safeinfer.engine.model_runner import ModelRunner
 
 
 def test_poisson_arrivals_have_requested_rate():
@@ -57,7 +60,7 @@ def test_static_batching_timings_are_consistent():
     model = AutoModelForCausalLM.from_config(cfg).eval()
     requests = build_workload(fixed_lengths(5, prompt_len=6, output_len=4) + [(3, 9)], math.inf, 256)
 
-    timings = run_static_batching(model, requests, max_batch_size=4)
+    timings = replay_static_batching(requests, hf_batch_runner(model), max_batch_size=4)
 
     assert sorted(t.request_id for t in timings) == list(range(6))
     for t in timings:
@@ -66,3 +69,38 @@ def test_static_batching_timings_are_consistent():
     first_batch_end = max(t.finish_time for t in timings if t.request_id < 4)
     second_batch_start = min(t.first_token_time for t in timings if t.request_id >= 4)
     assert second_batch_start > first_batch_end
+
+
+def test_engine_static_admits_by_kv_capacity(models):
+    _, ours = models
+    # Each request needs ceil((6 + 4) / 4) = 3 blocks; 7 blocks fit two at a time.
+    runner = ModelRunner(ours, num_blocks=7, block_size=4)
+    requests = build_workload(fixed_lengths(5, prompt_len=6, output_len=4), math.inf, 256)
+
+    timings = replay_static_batching(requests, engine_batch_runner(runner), 32, engine_can_admit(runner))
+
+    assert sorted(t.request_id for t in timings) == list(range(5))
+    starts = sorted({t.first_token_time for t in timings})
+    assert len(starts) == 3  # batches of 2, 2, 1
+    assert runner.block_manager.num_free_blocks == 7
+
+
+def test_replay_rejects_request_larger_than_server(models):
+    _, ours = models
+    runner = ModelRunner(ours, num_blocks=2, block_size=4)
+    requests = build_workload([(6, 4)], math.inf, 256)
+    with pytest.raises(RuntimeError, match="never be admitted"):
+        replay_static_batching(requests, engine_batch_runner(runner), 32, engine_can_admit(runner))
+
+
+def test_kv_utilization_hand_computed():
+    from safeinfer.bench.kv_utilization import analyze
+
+    # One request: prompt 3, output 2 -> lengths 4, 5 over its life.
+    rows = analyze([(3, 2)], max_model_len=10, block_sizes=[4], budget_tokens=100)
+    contiguous, paged = rows
+    assert contiguous["utilization"] == pytest.approx((4 + 5) / (10 + 10))
+    assert contiguous["concurrency"] == 10
+    # Paged reserves 4 slots at length 4, then 8 at length 5.
+    assert paged["utilization"] == pytest.approx((4 + 5) / (4 + 8))
+    assert paged["concurrency"] == 100 // 8

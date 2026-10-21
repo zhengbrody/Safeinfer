@@ -24,6 +24,8 @@ class DenseAttention:
         v: torch.Tensor,
         meta: AttentionMetadata,
     ) -> torch.Tensor:
+        if meta.query_lens != meta.context_lens:
+            raise ValueError("DenseAttention has no cache; every sequence must be a full prefill")
         out = torch.empty_like(q)
         start = 0
         for n in meta.query_lens:

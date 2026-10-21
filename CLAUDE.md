@@ -23,15 +23,25 @@ what is done.
 safeinfer/
 ├── config.py             ModelConfig parsed from raw config.json (llama, qwen2)
 ├── attention/
-│   ├── backend.py        AttentionMetadata + AttentionBackend protocol
-│   └── dense.py          cache-free causal attention (correctness reference)
+│   ├── backend.py        AttentionMetadata (query/context lens, slots, block tables) + protocol
+│   ├── dense.py          cache-free causal attention (correctness reference)
+│   └── torch_paged.py    paged KV: write slots, gather blocks, SDPA with offset causal mask
+├── memory/
+│   ├── block_manager.py  free list + per-sequence block tables; grow/free; invariants
+│   └── kv_cache.py       physical K/V blocks [layers, blocks, block_size, kv_heads, dim]; sizing
 ├── model/
 │   ├── llama.py          hand-written Llama/Qwen2 forward; HF-identical param names
 │   └── loader.py         safetensors -> model (meta-device init, tied embeddings)
+├── engine/
+│   ├── model_runner.py   SeqStep batch -> flattened forward on the paged cache -> logits
+│   └── static_batch.py   static batching on the paged engine (experiment group "engine A")
 └── bench/
     ├── workload.py       Request, Poisson arrivals, ShareGPT length sampling
     ├── metrics.py        RequestTiming -> throughput, TTFT/TPOT/E2E p50/p99
-    ├── hf_baseline.py    HF generate with static batching, real-time replay
+    ├── static_replay.py  real-time static-batching server loop shared by all static backends
+    ├── hf_baseline.py    HF generate as a static_replay backend
+    ├── engine_static.py  our engine as a static_replay backend; KV-capacity admission
+    ├── kv_utilization.py contiguous vs paged KV waste/concurrency on real lengths (no GPU)
     └── run_bench.py      CLI: one backend + one workload -> result JSON
 ```
 
@@ -43,8 +53,17 @@ safeinfer/
   chunked prefill) therefore needs no model changes; only backends and
   metadata grow.
 - **Attention is a pluggable backend.** The model owns projections and RoPE;
-  the backend owns KV storage and the attention op. Week 2 adds paged
-  backends alongside `DenseAttention`.
+  the backend owns KV storage and the attention op.
+- **One metadata shape for every step type.** A sequence's new tokens are the
+  last `query_len` of its `context_len` tokens: prefill, decode, and chunked
+  prefill are the same code path. SDPA's `is_causal` aligns top-left, so the
+  paged backend builds an offset causal mask explicitly.
+- **BlockManager is bookkeeping only** (no tensors): `grow(seq, n)` returns the
+  new tokens' slots (`block * block_size + offset`), `free(seq)` returns
+  blocks. `ModelRunner.step` checks capacity for the whole batch first, so a
+  step either fully happens or changes nothing.
+- **Static admission reserves worst case** (prompt + full output) because
+  static mode cannot preempt; continuous batching will admit optimistically.
 - **Probe activations come from the same forward.** `capture_layer=L` returns the
   residual stream after layer L (= HF `hidden_states[L+1]`).
 - **Logits only where needed.** `forward` returns hidden states;
@@ -71,9 +90,29 @@ pip install -e ".[dev]"
 pytest -q                     # CPU, ~5s
 SAFEINFER_TEST_MODEL=meta-llama/Llama-3.2-1B-Instruct pytest tests/test_real_checkpoint.py  # ~10 GB RAM
 ruff check . && ruff format --check .
-python -m safeinfer.bench.run_bench --backend hf --model <hf-id-or-dir> \
-    [--dataset sharegpt.json] --num-requests 200 --rate 4 --out results/hf_r4.json
+python -m safeinfer.bench.run_bench --backend {hf,engine-static} --model <hf-id-or-dir> \
+    [--dataset data/sharegpt.json] --num-requests 200 --rate 4 --out results/<name>.json
+python -m safeinfer.bench.kv_utilization --dataset data/sharegpt.json \
+    --model meta-llama/Llama-3.2-1B-Instruct --kv-budget-gib 16
 ```
+
+`data/` (ShareGPT, 650 MB) and `results/` are gitignored. ShareGPT:
+https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered
+(`ShareGPT_V3_unfiltered_cleaned_split.json`, saved as `data/sharegpt.json`).
+
+## Results so far
+
+KV utilization, 1000 ShareGPT requests (final length mean 456 / p50 374),
+Llama-3.2-1B (32 KiB/token bf16), 16 GiB KV budget, max_model_len 2048:
+
+| scheme | lifetime utilization | waste | max concurrent (memory bound) |
+|---|---|---|---|
+| contiguous, reserve 2048 | 19.4% | 80.6% | 256 |
+| paged, block 8 | 99.1% | 0.9% | 1,142 |
+| paged, block 16 | 98.2% | 1.8% | 1,132 |
+| paged, block 32 | 96.3% | 3.7% | 1,112 |
+
+Concurrency here is a memory bound; compute saturates well before ~1,100.
 
 ## Roadmap / status
 
@@ -83,8 +122,14 @@ python -m safeinfer.bench.run_bench --backend hf --model <hf-id-or-dir> \
   - [x] real Llama-3.2-1B-Instruct (fp32, CPU): logits bit-identical to HF (max diff 0), 24-step greedy identical
   - [x] workload generator, metrics, HF static-batching baseline, bench CLI, CI
   - [ ] run the baseline on a GPU with the target model (needs GPU access)
-- [ ] **Week 2: paged KV cache.** `memory/block_manager.py` (+ hypothesis property
-      tests), `memory/kv_cache.py`, `attention/torch_paged.py`; greedy matches HF
+- [x] **Week 2: paged KV cache**
+  - [x] BlockManager + stateful hypothesis tests (no leaks, no shared slots, exact counts)
+  - [x] KVCache, TorchPagedAttention, ModelRunner, static-batch generator
+  - [x] batched greedy == HF (tiny models + real Llama-3.2-1B); chunked prefill and
+        mixed prefill/decode steps == dense; mutation-checked
+  - [x] `engine-static` bench backend with KV-capacity admission
+  - [x] KV utilization analysis on ShareGPT (table above)
+  - [ ] GPU run: HF vs engine-static throughput + max batch at equal memory
 - [ ] **Week 3: continuous batching.** `scheduler/` (iteration-level, recompute
       preemption, token budget), `engine/engine.py`, `engine/sampler.py`; rate sweep
 - [ ] **Week 4: safety probes.** Label = did the generation comply (judge-labelled),
@@ -98,3 +143,6 @@ python -m safeinfer.bench.run_bench --backend hf --model <hf-id-or-dir> \
 - 2026-10-20: Project scaffold. Week-1 model, loader, parity tests, and bench tooling done.
 - 2026-10-20: Real-checkpoint parity test (opt-in via SAFEINFER_TEST_MODEL); Llama-3.2-1B bit-identical to HF.
   Ruff pinned with explicit rule set so local and CI lint agree.
+- 2026-10-20: Week 2 paged KV cache done (CPU-verified). Static replay loop factored out of
+  the HF baseline so all static backends share arrival/timing logic. KV analysis: 80.6% -> 1.8%
+  waste, 4.4x concurrency at equal memory.

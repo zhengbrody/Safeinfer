@@ -18,6 +18,8 @@ import torch
 
 from safeinfer.attention.backend import AttentionMetadata
 from safeinfer.attention.dense import DenseAttention
+from safeinfer.engine.model_runner import ModelRunner
+from safeinfer.engine.static_batch import generate_static
 from safeinfer.model.loader import load_model, resolve_model_dir
 
 MODEL = os.environ.get("SAFEINFER_TEST_MODEL")
@@ -65,3 +67,18 @@ def test_greedy_generation_matches(setup):
         tokens.append(int(ours.compute_logits(hidden[-1:]).argmax(-1)))
 
     assert tokens[len(prompt) :] == ref
+
+
+def test_paged_batched_generation_matches(setup):
+    """Two prompts of different lengths decoded together through the paged cache."""
+    hf, ours, prompt = setup
+    prompts = [prompt, prompt[:20]]
+    steps = 16
+    runner = ModelRunner(ours, num_blocks=16, block_size=16)
+
+    outputs = generate_static(runner, prompts, [steps, steps])
+
+    for p, got in zip(prompts, outputs, strict=True):
+        with torch.no_grad():
+            ref = hf.generate(torch.tensor([p]), max_new_tokens=steps, min_new_tokens=steps, do_sample=False)
+        assert got == ref[0, len(p) :].tolist()
