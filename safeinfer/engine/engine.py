@@ -32,15 +32,27 @@ class TokenOutput:
     finished: bool
     finish_reason: str | None  # "length", "stop", or "safety" once finished
     safety: SafetySignal | None = None  # set when a monitor is attached
+    # [len(capture_layers), hidden] on CPU, the activation that predicted this position;
+    # only with return_activations (offline data collection).
+    activations: torch.Tensor | None = None
 
 
 class LLMEngine:
-    def __init__(self, runner: ModelRunner, config: SchedulerConfig, monitor: SafetyMonitor | None = None):
+    def __init__(
+        self,
+        runner: ModelRunner,
+        config: SchedulerConfig,
+        monitor: SafetyMonitor | None = None,
+        return_activations: bool = False,
+    ):
         if monitor and not set(monitor.layers) <= set(runner.capture_layers):
             raise ValueError(f"runner must capture layers {monitor.layers}, captures {runner.capture_layers}")
+        if return_activations and not runner.capture_layers:
+            raise ValueError("return_activations needs a runner with capture_layers")
         self.runner = runner
         self.scheduler = Scheduler(config, runner.block_manager, runner.model.config.eos_token_ids)
         self.monitor = monitor
+        self.return_activations = return_activations
         self._next_seq_id = 0
 
     def add_request(self, prompt_token_ids: list[int], params: SamplingParams) -> int:
@@ -79,6 +91,8 @@ class LLMEngine:
         if self.monitor and self.monitor.stop:
             stopped = {s.seq_id for s, sig in zip(seqs, signals, strict=True) if sig.flagged}
 
+        acts = out.captured[rows].cpu() if self.return_activations else [None] * len(seqs)
+
         next_tokens = dict(zip(rows, tokens, strict=True))
         keep = [i for i, s in enumerate(scheduled) if s.seq.seq_id not in stopped]
         self.scheduler.update([scheduled[i] for i in keep], [next_tokens.get(i) for i in keep])
@@ -95,8 +109,9 @@ class LLMEngine:
                 s.finish_reason is not None,
                 s.finish_reason,
                 sig,
+                act,
             )
-            for s, tok, sig in zip(seqs, tokens, signals, strict=True)
+            for s, tok, sig, act in zip(seqs, tokens, signals, acts, strict=True)
         ]
 
     def _observe(self, seqs: list[Sequence], captured: torch.Tensor | None) -> list[SafetySignal | None]:

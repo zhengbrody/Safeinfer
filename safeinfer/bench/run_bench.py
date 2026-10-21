@@ -41,7 +41,7 @@ def _run_hf(args, device: torch.device) -> tuple[list[RequestTiming], dict]:
     return timings, {"max_batch_size": args.max_batch_size}
 
 
-def _make_runner(args, device: torch.device):
+def _make_runner(args, device: torch.device, capture_layers: tuple[int, ...] = ()):
     from safeinfer.engine.model_runner import ModelRunner
     from safeinfer.memory.kv_cache import gpu_kv_budget, num_blocks_for_budget
     from safeinfer.model.loader import load_model
@@ -54,7 +54,7 @@ def _make_runner(args, device: torch.device):
             raise SystemExit("--num-blocks is required off-GPU")
         budget = gpu_kv_budget(device, args.gpu_memory_utilization, activation_reserve_bytes=2**30)
         num_blocks = num_blocks_for_budget(model.config, args.block_size, dtype, budget)
-    return ModelRunner(model, num_blocks=num_blocks, block_size=args.block_size)
+    return ModelRunner(model, num_blocks=num_blocks, block_size=args.block_size, capture_layers=capture_layers)
 
 
 def _run_engine_static(args, device: torch.device) -> tuple[list[RequestTiming], dict]:
@@ -76,10 +76,14 @@ def _run_engine_static(args, device: torch.device) -> tuple[list[RequestTiming],
 def _run_engine(args, device: torch.device) -> tuple[list[RequestTiming], dict]:
     from safeinfer.bench.continuous_replay import replay_continuous
     from safeinfer.engine.engine import LLMEngine
+    from safeinfer.safety.monitor import SafetyMonitor
+    from safeinfer.safety.probe import LinearProbe
     from safeinfer.sampling_params import SamplingParams
     from safeinfer.scheduler.scheduler import SchedulerConfig
 
-    runner = _make_runner(args, device)
+    # Flag mode: the probe runs on every token but never changes outputs, so runs stay comparable.
+    monitor = SafetyMonitor(LinearProbe.load(args.probe, device), args.probe_k) if args.probe else None
+    runner = _make_runner(args, device, monitor.layers if monitor else ())
     requests = _make_requests(args, runner.model.config.vocab_size)
     config = SchedulerConfig(
         max_num_seqs=args.max_batch_size,
@@ -87,7 +91,7 @@ def _run_engine(args, device: torch.device) -> tuple[list[RequestTiming], dict]:
         max_model_len=args.max_total_len,
         enable_chunked_prefill=args.enable_chunked_prefill,
     )
-    engine = LLMEngine(runner, config)
+    engine = LLMEngine(runner, config, monitor)
 
     warm_params = SamplingParams(max_tokens=4, ignore_eos=True)
     _warm_up(lambda: engine.generate([requests[0].prompt_token_ids], [warm_params]), device)
@@ -98,6 +102,7 @@ def _run_engine(args, device: torch.device) -> tuple[list[RequestTiming], dict]:
         "num_blocks": runner.block_manager.num_blocks,
         "block_size": args.block_size,
         "num_preemptions": engine.num_preemptions - preemptions_before,
+        "probe": str(args.probe) if args.probe else None,
     }
 
 
@@ -158,6 +163,8 @@ def main() -> None:
     p.add_argument("--max-batch-size", type=int, default=32, help="static: batch size; engine: max running seqs")
     p.add_argument("--max-num-batched-tokens", type=int, help="engine: tokens per step (default --max-total-len)")
     p.add_argument("--enable-chunked-prefill", action="store_true", help="engine: split prompts across steps")
+    p.add_argument("--probe", type=Path, help="engine: run this safety probe on every token (flag mode)")
+    p.add_argument("--probe-k", type=int, default=2, help="engine: consecutive positions to flag")
     p.add_argument("--block-size", type=int, default=16, help="engine: tokens per KV block")
     p.add_argument("--num-blocks", type=int, help="engine: KV blocks; default sizes from free GPU memory")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9, help="engine: fraction of GPU memory to use")

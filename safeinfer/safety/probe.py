@@ -1,7 +1,9 @@
-"""A linear probe on one layer's residual stream: score = sigmoid(w . x + b).
+"""A linear probe on one layer's residual stream: logit = w . x + b.
 
 Feature standardization from training is folded into (w, b), so serving is
-one dot product per token. A probe file is a safetensors file with the
+one dot product per token. Thresholds live on the logit, not the probability:
+a confident probe pushes fp32 sigmoid to exactly 1.0, which would tie the
+very scores a low false-positive threshold has to separate. A probe file is a safetensors file with the
 weight tensor and its scalars in the metadata.
 """
 
@@ -20,14 +22,17 @@ class LinearProbe:
     layer: int  # reads the residual stream after this decoder layer
     weight: torch.Tensor  # [hidden], fp32
     bias: float
-    threshold: float  # score >= threshold counts as a positive
+    threshold: float  # logit >= threshold counts as a positive
 
     def to(self, device: torch.device | str) -> LinearProbe:
         return LinearProbe(self.layer, self.weight.to(device), self.bias, self.threshold)
 
-    def score(self, x: torch.Tensor) -> torch.Tensor:
-        """[..., hidden] activations (any dtype) -> [...] scores in (0, 1), fp32."""
-        return torch.sigmoid(x.float() @ self.weight + self.bias)
+    def logit(self, x: torch.Tensor) -> torch.Tensor:
+        """[..., hidden] activations (any dtype) -> [...] fp32 logits."""
+        return x.float() @ self.weight + self.bias
+
+    def prob(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.logit(x))
 
     @classmethod
     def from_standardized(

@@ -23,7 +23,7 @@ LAYER = 1
 HIDDEN = 64  # conftest TINY hidden_size
 
 
-def _probe(threshold: float = 0.5, layer: int = LAYER, seed: int = 0) -> LinearProbe:
+def _probe(threshold: float = 0.0, layer: int = LAYER, seed: int = 0) -> LinearProbe:
     w = torch.randn(HIDDEN, generator=torch.Generator().manual_seed(seed))
     return LinearProbe(layer, w, 0.0, threshold)
 
@@ -37,16 +37,17 @@ def test_standardization_folds_into_weights(tmp_path):
         torch.randn(8),
     )
     probe = LinearProbe.from_standardized(3, coef, 0.25, mean, std, threshold=0.7)
-    torch.testing.assert_close(probe.score(x), torch.sigmoid(((x - mean) / std) @ coef + 0.25))
+    torch.testing.assert_close(probe.logit(x), ((x - mean) / std) @ coef + 0.25)
+    torch.testing.assert_close(probe.prob(x), torch.sigmoid(probe.logit(x)))
 
     probe.save(tmp_path / "p.safetensors")
     loaded = LinearProbe.load(tmp_path / "p.safetensors")
     assert (loaded.layer, loaded.bias, loaded.threshold) == (3, probe.bias, 0.7)
-    torch.testing.assert_close(loaded.score(x), probe.score(x))
+    torch.testing.assert_close(loaded.logit(x), probe.logit(x))
 
 
 def test_consecutive_rule_is_sticky_and_needs_a_run():
-    probe = LinearProbe(0, torch.ones(1), 0.0, threshold=0.5)  # score >= 0.5 iff x >= 0
+    probe = LinearProbe(0, torch.ones(1), 0.0, threshold=0.0)  # flags iff x >= 0
     mon = SafetyMonitor(probe, consecutive=2)
     flags = []
     for pos, x in enumerate([1.0, -1.0, 1.0, 1.0, -1.0]):
@@ -57,7 +58,7 @@ def test_consecutive_rule_is_sticky_and_needs_a_run():
 
 
 def test_positions_must_advance_by_one():
-    mon = SafetyMonitor(LinearProbe(0, torch.ones(1), 0.0, 0.5))
+    mon = SafetyMonitor(LinearProbe(0, torch.ones(1), 0.0, 0.0))
     mon.observe([1], [0], {0: torch.zeros(1, 1)})
     with pytest.raises(ValueError, match="expected 1"):
         mon.observe([1], [0], {0: torch.zeros(1, 1)})  # rescoring a position (e.g. after recompute)
@@ -66,14 +67,14 @@ def test_positions_must_advance_by_one():
 
 
 def test_input_probe_scores_only_position_zero():
-    probe = LinearProbe(0, torch.ones(1), 0.0, 0.5)
-    mon = SafetyMonitor(probe, input_probe=LinearProbe(2, torch.ones(1), 0.0, 0.5))
+    probe = LinearProbe(0, torch.ones(1), 0.0, 0.0)
+    mon = SafetyMonitor(probe, input_probe=LinearProbe(2, torch.ones(1), 0.0, 0.0))
     assert mon.layers == (0, 2)
     acts = {0: torch.zeros(2, 1), 2: torch.zeros(2, 1)}
     a, b = mon.observe([1, 2], [0, 0], acts)
-    assert a.input_score == b.input_score == 0.5
+    assert a.input_logit == b.input_logit == 0.0
     a, _ = mon.observe([1, 2], [1, 1], acts)
-    assert a.input_score is None
+    assert a.input_logit is None
 
 
 def _engine(model, monitor, num_blocks=10, chunked=True, budget=6):
@@ -121,7 +122,7 @@ def test_engine_scores_every_position_from_the_right_activation(models):
             ctx = p + toks[:t]
             meta = AttentionMetadata.for_prefill([len(ctx)])
             _, ref = ours(torch.tensor(ctx), torch.arange(len(ctx)), DenseAttention(), meta, capture_layers=(LAYER,))
-            assert sig.score == pytest.approx(probe.score(ref[-1, 0]).item(), abs=1e-5)
+            assert sig.logit == pytest.approx(probe.logit(ref[-1, 0]).item(), abs=1e-4)
 
 
 def test_flag_mode_does_not_change_outputs_and_stop_mode_withholds_flagged_token(models):
@@ -132,7 +133,7 @@ def test_flag_mode_does_not_change_outputs_and_stop_mode_withholds_flagged_token
     assert flagged == plain
 
     # Pick a threshold so request 1 first reaches two consecutive hits at a known position.
-    scores = [s.score for s in signals[1]]
+    scores = [s.logit for s in signals[1]]
     pairs = [min(scores[t - 1], scores[t]) for t in range(1, len(scores))]
     threshold = sorted(pairs)[-1]  # only the best adjacent pair clears it
     first = 1 + pairs.index(threshold)
@@ -155,3 +156,36 @@ def test_engine_requires_captured_probe_layer(models):
     runner = ModelRunner(ours, num_blocks=10, block_size=4)
     with pytest.raises(ValueError, match="capture layers"):
         LLMEngine(runner, SchedulerConfig(max_model_len=32), SafetyMonitor(_probe()))
+
+
+def test_fit_probe_separates_and_folds_standardization():
+    from safeinfer.safety.metrics import auroc
+    from safeinfer.safety.train import fit_probe
+
+    g = torch.Generator().manual_seed(0)
+    direction = torch.randn(16, generator=g)
+    x = torch.randn(400, 16, generator=g) * 3 + 5  # off-center, unscaled: folding must handle both
+    y = (x - 5) @ direction + 0.3 * torch.randn(400, generator=g) > 0
+    probe = fit_probe(x.numpy(), y.numpy(), torch.ones(400).numpy(), l2=1e-3, layer=4)
+    s = probe.logit(x).numpy()
+    assert probe.layer == 4
+    assert auroc(s, y.numpy()) > 0.98
+    assert abs(float((s >= 0).mean()) - float(y.float().mean())) < 0.05
+
+
+def test_engine_returns_the_activation_that_predicted_each_token(models):
+    _, ours = models
+    prompt = _prompts()[1]
+    runner = ModelRunner(ours, num_blocks=10, block_size=4, capture_layers=(0, LAYER))
+    config = SchedulerConfig(max_num_batched_tokens=6, max_model_len=32, enable_chunked_prefill=True)
+    engine = LLMEngine(runner, config, return_activations=True)
+    engine.add_request(prompt, SamplingParams(max_tokens=5, ignore_eos=True))
+    outs = []
+    while engine.has_unfinished_requests():
+        outs += engine.step()
+    toks = [o.token_id for o in outs]
+    for t, o in enumerate(outs):
+        ctx = prompt + toks[:t]
+        meta = AttentionMetadata.for_prefill([len(ctx)])
+        _, ref = ours(torch.tensor(ctx), torch.arange(len(ctx)), DenseAttention(), meta, capture_layers=(0, LAYER))
+        torch.testing.assert_close(o.activations, ref[-1], atol=1e-5, rtol=1e-5)

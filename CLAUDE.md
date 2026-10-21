@@ -40,7 +40,17 @@ safeinfer/
 │   ├── model_runner.py   SeqStep batch -> flattened forward on the paged cache -> logits
 │   ├── static_batch.py   static batching on the paged engine (experiment group "engine A")
 │   ├── sampler.py        batched temperature/top-k/top-p filtering, per-request RNG draws
-│   └── engine.py         LLMEngine: schedule -> run -> sample -> update, one step at a time
+│   └── engine.py         LLMEngine: schedule -> run -> sample -> monitor -> update, one step at a time
+├── safety/
+│   ├── probe.py          LinearProbe: logit = w.x + b on one layer (standardization folded in)
+│   ├── monitor.py        SafetyMonitor: k-consecutive rule keyed by output position; flag/stop
+│   ├── metrics.py        run score, first flag, AUROC, threshold at FPR, Wilson CI (numpy)
+│   │   offline pipeline (needs the [safety] extra):
+│   ├── datasets.py       harmful/benign requests x 5 attack families, request-grouped splits, XSTest
+│   ├── collect.py        generate with our engine; store per-position activations (memmap)
+│   ├── verify_acts.py    QA: stored activations vs CPU fp32 teacher-forced recompute
+│   ├── judge.py          Llama Guard 3 1B on our engine: response label, prompt-only, streaming
+│   └── train.py          probe training, layer/L2 sweep, calibration, OOD, baselines -> report.json
 └── bench/
     ├── workload.py       Request, Poisson arrivals, ShareGPT length sampling
     ├── metrics.py        RequestTiming -> throughput, TTFT/TPOT/E2E p50/p99
@@ -91,8 +101,29 @@ safeinfer/
   Filtering is batched; only the final multinomial draw loops over rows.
 - **Stop tokens are kept in the output**; `ignore_eos` (benchmarks) disables
   model EOS but not explicit `stop_token_ids`.
-- **Probe activations come from the same forward.** `capture_layer=L` returns the
-  residual stream after layer L (= HF `hidden_states[L+1]`).
+- **Probe activations come from the same forward.** `capture_layers=(...)` returns the
+  residual streams after those layers (slice j = HF `hidden_states[L_j+1]`).
+- **Probe label = "the generation complied with something unsafe"**, judged by
+  Llama Guard 3 1B on (base request, response), not the prompt's topic. A
+  harmful request the model refuses is a negative. The input probe is separate
+  (label = request harmful) and only reports: stopping on it adds over-refusal.
+- **Position t = the activation that predicts output token t** (t=0 is the
+  prompt's last token). Stop mode flags at t and withholds token t. The same
+  definition is used online (monitor), offline (collect), and in metrics.
+- **Thresholds are logits, calibrated at 1% FPR on val *benign requests***
+  (blocking benign users is the cost; flagging a refusal is free). fp32 sigmoid
+  saturates at 1.0 and would tie the scores a strict threshold must separate.
+  The offline run score `max_t min(logits[t-k+1..t])` is exactly the online
+  k-consecutive rule, so reported ROC/TPR describe the deployed rule.
+- **Splits are by base request**, so a test request never appears in training
+  under another wrapper; benign requests are wrapped by the same attack
+  templates, so "looks like a jailbreak" alone cannot separate the classes.
+- **MPS decode workaround.** torch 2.9's MPS single-query SDPA kernel (no mask)
+  returned NaN or wrong-but-finite values nondeterministically on real Llama
+  decodes (~1k context, bf16); prefill (masked) was always correct. On MPS the
+  paged backend passes an explicit all-true mask for decode. CUDA is untouched.
+  `verify_acts` caught it (old collection: 33/120 sampled generations below
+  cosine 0.98; fixed: min cosine 0.9995).
 - **Logits only where needed.** `forward` returns hidden states;
   `compute_logits` runs on just the rows being sampled (the last token of
   each sequence), never the whole prefill.
@@ -127,7 +158,20 @@ for r in 1 2 4 8 16 inf; do for b in hf engine-static engine; do
 done; done
 python -m safeinfer.bench.kv_utilization --dataset data/sharegpt.json \
     --model meta-llama/Llama-3.2-1B-Instruct --kv-budget-gib 16
+# probe pipeline (pip install -e ".[safety]"); ~1.5 h on an M-series Mac
+python -m safeinfer.safety.datasets                       # -> data/safety/prompts.jsonl (3829)
+python -m safeinfer.safety.collect --prompts data/safety/prompts.jsonl --out data/safety/gens_v2 \
+    --model meta-llama/Llama-3.2-1B-Instruct --device mps  # resumable; rerun after an MPS OOM
+python -m safeinfer.safety.verify_acts --gens data/safety/gens_v2 --prompts data/safety/prompts.jsonl
+python -m safeinfer.safety.judge --prompts data/safety/prompts.jsonl --gens data/safety/gens_v2 --device mps
+    # stages cache to judge_*.json; if MPS OOMs, rerun with --device cpu --dtype float32 to finish
+python -m safeinfer.safety.train --prompts data/safety/prompts.jsonl --gens data/safety/gens_v2 --out results/safety
+# probe overhead: run_bench --backend engine ... with and without --probe results/safety/output_probe.safetensors
 ```
+
+MPS note: every step has a new batch shape and Metal's per-shape caches grow
+until "MPS backend out of memory" (~3k prompts in); collect and judge are
+resumable for that reason.
 
 `data/` (ShareGPT, 650 MB) and `results/` are gitignored. ShareGPT:
 https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered
@@ -156,6 +200,54 @@ at t=0, batch 8). Directional only; real numbers need a GPU:
 | engine-static | 37.5 | 16.2 s | 31.8 s |
 | engine (continuous) | 48.5 | 1.6 s | 24.8 s |
 
+### Safety probes (Llama-3.2-1B-Instruct, bf16 on MPS, greedy, 128 tokens)
+
+Data: 3829 prompts from 1950 base requests (800 harmful: AdvBench, HarmBench
+standard, JBB; 700 benign: Alpaca, JBB benign; + 450 XSTest), 5 attack
+families. Judge-labelled compliance rate on harmful requests: direct 9%,
+prefix injection 2%, refusal suppression 48%, in-the-wild templates 6%,
+PAIR 20% (317 complied generations in total). Judge vs refusal-phrase
+heuristic disagree on 184 of 2179 harmful-request generations (label noise
+to audit by hand).
+
+Output probe (layer 8 of 16, k=2, threshold at 1% val-benign FPR), test split
+(693 generations, 82 complied):
+
+| metric | value |
+|---|---|
+| AUROC (generation level, k=2 run score) | 0.972 |
+| TPR (compliant generations stopped) | 39% [29, 50] |
+| benign FPR | 1.3% [0.4, 3.7] |
+| XSTest safe prompts flagged | 4.0% |
+| median tokens emitted before the flag | 43.5 (12.5% within 16) |
+
+Leave-one-family-out (trained without the family, k=2): AUROC prefix injection
+0.97, refusal suppression 0.88, in-the-wild templates 0.98, PAIR 1.00 (8
+positives); TPR 50% / 33% / 20% / 62%, wide CIs. Refusal suppression is the
+real OOD gap.
+
+Input probe (layer 10, prompt's last token, label = request harmful) vs
+Llama Guard 3 1B classifying the same prompt (test split; XSTest held out):
+
+| | AUROC | harmful flagged | benign flagged | XSTest safe flagged | XSTest unsafe flagged |
+|---|---|---|---|---|---|
+| input probe @ 1% val FPR | 0.992 | 88.9% | 1.7% | 0.8% | 53.0% |
+| Llama Guard prompt @ 0.5 | 0.967 | 93.7% | 11.6% | 21.2% | 57.5% |
+| Llama Guard prompt @ 1% val FPR | 0.967 | 19.5% | 0.0% | 4.8% | 15.0% |
+
+The probe is trained on these sources and Guard is zero-shot, so the
+in-distribution rows favor the probe; XSTest is unseen by both.
+
+Streaming moderation (Guard on response prefixes every 16 tokens): on the 32
+test generations both catch, Guard flags after a median 16 tokens vs 43.5 for
+the probe, at 4.4 extra 1B forwards per generation. The probe's cost is one
+2048-d dot product per token: CPU engine throughput 98.6 vs 99.7 tok/s
+without/with it (within run-to-run noise).
+
+Takeaway: the output probe is a cheap, decent ranker but at a strict FPR it
+catches ~40% and later than streaming Guard; the input probe is the strong
+result (Guard-level detection, far less over-refusal, ~free).
+
 ## Roadmap / status
 
 - [x] **Week 1: model, baseline, measurement**
@@ -181,9 +273,15 @@ at t=0, batch 8). Directional only; real numbers need a GPU:
         every request finishes (~half the random cases preempt); mutation-checked
   - [x] `engine` bench backend + continuous replay loop
   - [ ] GPU rate sweep: hf vs engine-static vs engine (commands above)
-- [ ] **Week 4: safety probes.** Label = did the generation comply (judge-labelled),
-      not prompt topic; separate input vs output probes; OOD split by attack family;
-      over-refusal check; streaming-moderation baseline
+- [x] **Week 4: safety probes**
+  - [x] multi-layer capture, LinearProbe, SafetyMonitor (flag/stop, k-consecutive by position);
+        scores verified vs cache-free recompute under chunked prefill + preemption; mutation-checked
+  - [x] dataset (5 attack families, request-grouped splits, XSTest), collection on our engine,
+        activation QA, Llama Guard judge on our engine (== HF to 1e-6)
+  - [x] input/output probes, layer + L2 sweep, logit thresholds at 1% benign FPR, Wilson CIs,
+        leave-one-family-out, prompt-moderation and streaming-moderation baselines, overhead
+  - [ ] hand-audit ~100 judge labels (the 184 judge/heuristic disagreements first)
+  - [ ] GPU: probe overhead under load (`run_bench --probe`), larger model (Llama-3.1-8B)
 - [ ] **Week 5: speed + write-up.** CUDA graphs for decode first, then a Triton
       paged-decode kernel; profiler-backed gap analysis vs vLLM
 
@@ -198,3 +296,7 @@ at t=0, batch 8). Directional only; real numbers need a GPU:
 - 2026-10-20: Week 3 continuous batching done (CPU-verified): scheduler, sampler, LLMEngine,
   `engine` bench backend. run_bench model/KV setup shared by both engine backends. CPU smoke:
   continuous 1.6x HF output throughput, p50 TTFT 24 s -> 1.6 s.
+- 2026-10-20: Week 4 safety probes. Engine-side monitor (4a) then the offline pipeline. Found
+  and worked around an MPS decode-SDPA bug that silently corrupted the first collection (33 of
+  120 QA-sampled generations, half of them the longest, failed); data regenerated and verified. Thresholds moved to logit
+  space. Results in "Safety probes" above.

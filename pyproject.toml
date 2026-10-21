@@ -17,7 +17,9 @@ dependencies = [
 [project.optional-dependencies]
 # transformers is only a test oracle and the benchmark baseline, never an engine dependency.
 bench = ["transformers>=4.45"]
-dev = ["transformers>=4.45", "pytest", "hypothesis", "ruff==0.15.12"]
+# Offline probe pipeline (datasets / collect / judge / train).
+safety = ["transformers>=4.45", "pandas", "pyarrow"]
+dev = ["transformers>=4.45", "pandas", "pytest", "hypothesis", "ruff==0.15.12"]
 
 [tool.setuptools.packages.find]
 include = ["safeinfer*"]

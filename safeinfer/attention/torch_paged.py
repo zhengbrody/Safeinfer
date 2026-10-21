@@ -51,6 +51,11 @@ def _causal_mask(q_len: int, ctx_len: int, device: torch.device) -> torch.Tensor
     query is shorter than the context, so build it explicitly.
     """
     if q_len == 1:
+        if device.type == "mps":
+            # torch 2.9's MPS single-query SDPA kernel (used when no mask is given) returned
+            # NaN or wrong values nondeterministically on real Llama decodes (seen at ~1k context,
+            # bf16). An explicit all-true mask routes to the general kernel, which is correct.
+            return torch.ones(1, ctx_len, dtype=torch.bool, device=device)
         return None  # a single (newest) query sees the whole context
     q_pos = torch.arange(ctx_len - q_len, ctx_len, device=device)[:, None]
     k_pos = torch.arange(ctx_len, device=device)[None, :]

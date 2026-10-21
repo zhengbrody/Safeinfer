@@ -3,7 +3,7 @@
 At output position t the engine has the residual stream of the token that
 predicts token t (position 0 = the prompt's last token). The output probe
 scores every position; a sequence is *flagged* once `consecutive` positions
-in a row score at or above the probe threshold, which trades a little
+in a row have a logit at or above the probe threshold, which trades a little
 latency for robustness to single-token spikes. With `stop=True` a flagged
 sequence ends before token t is emitted.
 
@@ -27,8 +27,8 @@ from safeinfer.safety.probe import LinearProbe
 
 @dataclass(frozen=True)
 class SafetySignal:
-    score: float  # output probe at this position
-    input_score: float | None  # input probe on the prompt; position 0 only
+    logit: float  # output probe at this position
+    input_logit: float | None  # input probe on the prompt; position 0 only
     flagged: bool  # `consecutive` positions in a row reached the threshold, here or earlier
 
 
@@ -68,23 +68,23 @@ class SafetyMonitor:
         activations: dict[int, torch.Tensor],  # layer -> [len(seq_ids), hidden]
     ) -> list[SafetySignal]:
         """Score one sampled position per sequence; positions must advance by one per call."""
-        scores = self.output_probe.score(activations[self.output_probe.layer]).tolist()
-        input_scores: list[float | None] = [None] * len(seq_ids)
+        logits = self.output_probe.logit(activations[self.output_probe.layer]).tolist()
+        input_logits: list[float | None] = [None] * len(seq_ids)
         first = [i for i, pos in enumerate(positions) if pos == 0]
         if self.input_probe and first:
-            vals = self.input_probe.score(activations[self.input_probe.layer][first]).tolist()
+            vals = self.input_probe.logit(activations[self.input_probe.layer][first]).tolist()
             for i, v in zip(first, vals, strict=True):
-                input_scores[i] = v
+                input_logits[i] = v
 
         signals = []
-        for seq_id, pos, score, input_score in zip(seq_ids, positions, scores, input_scores, strict=True):
+        for seq_id, pos, logit, input_logit in zip(seq_ids, positions, logits, input_logits, strict=True):
             st = self._state.setdefault(seq_id, _SeqState())
             if pos != st.next_position:
                 raise ValueError(f"seq {seq_id}: observed position {pos}, expected {st.next_position}")
             st.next_position += 1
-            st.run = st.run + 1 if score >= self.output_probe.threshold else 0
+            st.run = st.run + 1 if logit >= self.output_probe.threshold else 0
             st.flagged = st.flagged or st.run >= self.consecutive
-            signals.append(SafetySignal(score, input_score, st.flagged))
+            signals.append(SafetySignal(logit, input_logit, st.flagged))
         return signals
 
     def release(self, seq_id: int) -> None:
