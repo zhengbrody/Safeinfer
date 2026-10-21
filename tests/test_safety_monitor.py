@@ -135,8 +135,12 @@ def test_flag_mode_does_not_change_outputs_and_stop_mode_withholds_flagged_token
     # Pick a threshold so request 1 first reaches two consecutive hits at a known position.
     scores = [s.logit for s in signals[1]]
     pairs = [min(scores[t - 1], scores[t]) for t in range(1, len(scores))]
-    threshold = sorted(pairs)[-1]  # only the best adjacent pair clears it
-    first = 1 + pairs.index(threshold)
+    # Midway between the best and second-best adjacent pairs: only the best clears it, with a margin
+    # for the ~1e-6 logit drift a different batch composition causes once other requests stop.
+    best, second = sorted(pairs)[-1], sorted(pairs)[-2]
+    assert best - second > 1e-3
+    threshold = (best + second) / 2
+    first = 1 + pairs.index(best)
 
     stop_mon = SafetyMonitor(_probe(threshold), consecutive=2, stop=True)
     engine = _engine(ours, stop_mon)
