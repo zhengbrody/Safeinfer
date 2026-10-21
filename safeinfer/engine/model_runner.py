@@ -29,7 +29,7 @@ class SeqStep:
 @dataclass
 class StepOutput:
     logits: torch.Tensor  # [num_seqs, vocab], fp32, last token of each sequence
-    captured: torch.Tensor | None  # [num_seqs, hidden], residual stream after capture_layer
+    captured: torch.Tensor | None  # [num_seqs, len(capture_layers), hidden], last token of each sequence
 
 
 class ModelRunner:
@@ -38,7 +38,7 @@ class ModelRunner:
         model: LlamaForCausalLM,
         num_blocks: int,
         block_size: int = 16,
-        capture_layer: int | None = None,
+        capture_layers: tuple[int, ...] = (),
     ):
         self.model = model
         weight = model.model.embed_tokens.weight
@@ -46,7 +46,7 @@ class ModelRunner:
         self.block_manager = BlockManager(num_blocks, block_size)
         self.kv_cache = KVCache(model.config, num_blocks, block_size, weight.dtype, self.device)
         self.backend = TorchPagedAttention(self.kv_cache)
-        self.capture_layer = capture_layer
+        self.capture_layers = tuple(capture_layers)
 
     def step(self, batch: list[SeqStep]) -> StepOutput:
         """Append each sequence's new tokens to its cache and return next-token logits.
@@ -83,7 +83,7 @@ class ModelRunner:
             torch.tensor(positions, device=self.device),
             self.backend,
             meta,
-            capture_layer=self.capture_layer,
+            capture_layers=self.capture_layers,
         )
         last = meta.last_token_indices(self.device)
         return StepOutput(

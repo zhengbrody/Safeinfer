@@ -27,7 +27,7 @@ def test_logits_and_hidden_states_match_hf(models):
     input_ids, positions, meta = _flatten(prompts)
     capture = 1
 
-    hidden, captured = ours(input_ids, positions, DenseAttention(), meta, capture_layer=capture)
+    hidden, captured = ours(input_ids, positions, DenseAttention(), meta, capture_layers=(capture,))
     logits = ours.compute_logits(hidden)
 
     start = 0
@@ -36,7 +36,7 @@ def test_logits_and_hidden_states_match_hf(models):
         with torch.no_grad():
             ref = hf(torch.tensor([p]), output_hidden_states=True)
         torch.testing.assert_close(logits[start:end], ref.logits[0], atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(captured[start:end], ref.hidden_states[capture + 1][0], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(captured[start:end, 0], ref.hidden_states[capture + 1][0], atol=1e-5, rtol=1e-5)
         start = end
 
 

@@ -28,7 +28,7 @@ class Sequence:
     status: SequenceStatus = SequenceStatus.WAITING
     # Tokens whose K/V are in the cache. Reset to 0 on preemption (recompute).
     num_computed_tokens: int = 0
-    finish_reason: str | None = None  # "length" or "stop"
+    finish_reason: str | None = None  # "length", "stop", or "safety"
 
     @property
     def num_tokens(self) -> int:

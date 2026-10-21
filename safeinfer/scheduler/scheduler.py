@@ -159,13 +159,23 @@ class Scheduler:
             seq.output_token_ids.append(tok)
             reason = self._stop_reason(seq, tok)
             if reason:
-                seq.status = SequenceStatus.FINISHED
-                seq.finish_reason = reason
-                self.block_manager.free(seq.seq_id)
+                self._release(seq, reason)
                 finished.append(seq)
         if finished:
             self.running = [s for s in self.running if s.status is SequenceStatus.RUNNING]
         return finished
+
+    def finish(self, seq: Sequence, reason: str) -> None:
+        """End a running sequence early (e.g. a safety stop); frees its blocks."""
+        if seq.status is not SequenceStatus.RUNNING:
+            raise ValueError(f"seq {seq.seq_id} is {seq.status.value}, not running")
+        self._release(seq, reason)
+        self.running.remove(seq)
+
+    def _release(self, seq: Sequence, reason: str) -> None:
+        seq.status = SequenceStatus.FINISHED
+        seq.finish_reason = reason
+        self.block_manager.free(seq.seq_id)
 
     def _stop_reason(self, seq: Sequence, tok: int) -> str | None:
         p = seq.params

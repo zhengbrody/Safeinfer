@@ -62,12 +62,12 @@ def test_chunked_prefill_and_mixed_batch_match_dense(models):
 def test_captured_activation_is_last_token_of_each_sequence(models):
     _, ours = models
     prompts = [_prompt(6, seed=3), _prompt(9, seed=4)]
-    runner = ModelRunner(ours, num_blocks=16, block_size=BLOCK_SIZE, capture_layer=1)
+    runner = ModelRunner(ours, num_blocks=16, block_size=BLOCK_SIZE, capture_layers=(1, 2))
     out = runner.step([SeqStep(i, p) for i, p in enumerate(prompts)])
 
     for i, p in enumerate(prompts):
         meta = AttentionMetadata.for_prefill([len(p)])
-        _, ref = ours(torch.tensor(p), torch.arange(len(p)), DenseAttention(), meta, capture_layer=1)
+        _, ref = ours(torch.tensor(p), torch.arange(len(p)), DenseAttention(), meta, capture_layers=(1, 2))
         torch.testing.assert_close(out.captured[i], ref[-1], atol=1e-5, rtol=1e-5)
 
 

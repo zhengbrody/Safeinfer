@@ -149,22 +149,24 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,  # [num_tokens]
         backend: AttentionBackend,
         meta: AttentionMetadata,
-        capture_layer: int | None = None,
+        capture_layers: tuple[int, ...] = (),
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Returns (final normed hidden states, residual stream after `capture_layer`).
+        """Returns (final normed hidden states, residual streams after `capture_layers`).
 
-        The captured activation is what the safety probe reads; it comes from
-        the same forward pass, so probing never costs an extra forward. It
-        equals HF's `hidden_states[capture_layer + 1]`.
+        Captured activations are what safety probes read; they come from the
+        same forward pass, so probing never costs an extra forward. Shape
+        [num_tokens, len(capture_layers), hidden]; slice j equals HF's
+        `hidden_states[capture_layers[j] + 1]`. None if nothing is captured.
         """
         x = self.model.embed_tokens(input_ids)
         cos, sin = self.model.rotary_emb(positions, x.dtype)
-        captured = None
+        captured = {}
         for i, layer in enumerate(self.model.layers):
             x = layer(x, cos, sin, backend, meta)
-            if i == capture_layer:
-                captured = x
-        return self.model.norm(x), captured
+            if i in capture_layers:
+                captured[i] = x
+        stacked = torch.stack([captured[i] for i in capture_layers], dim=1) if capture_layers else None
+        return self.model.norm(x), stacked
 
     @torch.inference_mode()
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:

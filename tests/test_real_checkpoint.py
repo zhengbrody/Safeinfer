@@ -45,12 +45,15 @@ def setup():
 def test_prefill_logits_match(setup):
     hf, ours, prompt = setup
     meta = AttentionMetadata.for_prefill([len(prompt)])
-    hidden, captured = ours(torch.tensor(prompt), torch.arange(len(prompt)), DenseAttention(), meta, capture_layer=7)
+    hidden, captured = ours(
+        torch.tensor(prompt), torch.arange(len(prompt)), DenseAttention(), meta, capture_layers=(3, 7)
+    )
     with torch.no_grad():
         ref = hf(torch.tensor([prompt]), output_hidden_states=True)
 
     torch.testing.assert_close(ours.compute_logits(hidden), ref.logits[0], atol=1e-3, rtol=1e-4)
-    torch.testing.assert_close(captured, ref.hidden_states[8][0], atol=1e-3, rtol=1e-4)
+    for j, layer in enumerate((3, 7)):
+        torch.testing.assert_close(captured[:, j], ref.hidden_states[layer + 1][0], atol=1e-3, rtol=1e-4)
 
 
 def test_greedy_generation_matches(setup):
