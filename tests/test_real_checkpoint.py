@@ -43,9 +43,7 @@ def setup():
 def test_prefill_logits_match(setup):
     hf, ours, prompt = setup
     meta = AttentionMetadata.for_prefill([len(prompt)])
-    hidden, captured = ours(
-        torch.tensor(prompt), torch.arange(len(prompt)), DenseAttention(), meta, capture_layer=7
-    )
+    hidden, captured = ours(torch.tensor(prompt), torch.arange(len(prompt)), DenseAttention(), meta, capture_layer=7)
     with torch.no_grad():
         ref = hf(torch.tensor([prompt]), output_hidden_states=True)
 
