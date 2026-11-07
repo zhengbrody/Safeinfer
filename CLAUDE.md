@@ -300,3 +300,5 @@ result (Guard-level detection, far less over-refusal, ~free).
   and worked around an MPS decode-SDPA bug that silently corrupted the first collection (33 of
   120 QA-sampled generations, half of them the longest, failed); data regenerated and verified. Thresholds moved to logit
   space. Results in "Safety probes" above.
+- 2026-11-07: README rewritten as the recruiter-facing overview (highlights, architecture diagram,
+  design decisions, results, MPS debugging story); CLAUDE.md stays the full engineering notes.
